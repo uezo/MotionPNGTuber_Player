@@ -145,6 +145,22 @@ label {
     gap: 10px;
 }
 
+.toggle-row {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.hint {
+    font-size: 0.85rem;
+    color: #aaa;
+}
+
+.slider-hint {
+    margin-left: 8px;
+}
+
 input[type="range"] {
     width: 150px;
 }

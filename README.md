@@ -1,5 +1,12 @@
 # MotionPNGTuber Player
 
+更新日: 2026-01-15
+
+更新情報:
+- HQ Audio（キビキビ）をデフォルトONに変更
+- HQ Audioの音声解析を改善（ノイズゲート/感度反映/反応速度）
+- 感度スライダーに説明を追加
+
 > **[MotionPNGTuber](https://github.com/rotejin/MotionPNGTuber)** のブラウザ版再生専用パッケージ
 
 ブラウザで動作する軽量なPNGTuberリップシンクプレイヤーです。

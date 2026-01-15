@@ -12,6 +12,7 @@ class LipsyncEngine {
         this.volumeMeter = document.getElementById('volume-meter');
         this.sensitivitySlider = document.getElementById('sensitivity');
         this.sensitivityValue = document.getElementById('sensitivity-value');
+        this.hqAudioToggle = document.getElementById('hq-audio');
         this.stage = document.getElementById('stage');
         this.video = document.getElementById('base-video');
         this.mouthCanvas = document.getElementById('mouth-canvas');
@@ -40,6 +41,11 @@ class LipsyncEngine {
         this.volume = 0;
         this.smoothedHighRatio = 0;
         this.sensitivity = 50;
+        this.hqAudioEnabled = false;
+        this.envelope = 0;
+        this.noiseFloor = 0.002;
+        this.levelPeak = 0.02;
+        this.mouthChangeMinMs = 70;
 
         // 口状態
         this.mouthState = 'closed';
@@ -63,6 +69,16 @@ class LipsyncEngine {
             this.sensitivity = parseInt(e.target.value, 10);
             this.sensitivityValue.textContent = this.sensitivity;
         });
+        if (this.hqAudioToggle) {
+            this.hqAudioEnabled = this.hqAudioToggle.checked;
+            this.mouthChangeMinMs = this.hqAudioEnabled ? 45 : 70;
+            this.hqAudioToggle.addEventListener('change', (e) => {
+                this.hqAudioEnabled = e.target.checked;
+                this.mouthChangeMinMs = this.hqAudioEnabled ? 45 : 70;
+                this.resetAudioStats();
+                this.log(this.hqAudioEnabled ? 'HQ Audio: ON' : 'HQ Audio: OFF');
+            });
+        }
         this.startBtn.addEventListener('click', () => this.start());
         this.stopBtn.addEventListener('click', () => this.stop());
 
@@ -251,14 +267,39 @@ class LipsyncEngine {
 
         try {
             const deviceId = this.micSelect.value;
-            this.micStream = await navigator.mediaDevices.getUserMedia({
-                audio: { deviceId: deviceId ? { exact: deviceId } : undefined }
-            });
+            const baseAudio = {};
+            if (deviceId) {
+                baseAudio.deviceId = { exact: deviceId };
+            }
+            let audioConstraints = { ...baseAudio };
+            if (this.hqAudioEnabled) {
+                audioConstraints.echoCancellation = false;
+                audioConstraints.noiseSuppression = false;
+                audioConstraints.autoGainControl = false;
+            }
+            try {
+                this.micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: audioConstraints,
+                });
+            } catch (err) {
+                if (this.hqAudioEnabled) {
+                    console.warn(
+                        'HQ Audio constraints failed, fallback to default:',
+                        err
+                    );
+                    this.micStream = await navigator.mediaDevices.getUserMedia({
+                        audio: baseAudio,
+                    });
+                } else {
+                    throw err;
+                }
+            }
 
             this.micStartBtn.textContent = 'マイク接続中';
             this.micStartBtn.disabled = true;
             this.micStopBtn.disabled = false;
 
+            this.resetAudioStats();
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
             if (!this.audioContext.audioWorklet) {
                 throw new Error('AudioWorklet未対応のブラウザです');
@@ -318,17 +359,31 @@ class LipsyncEngine {
             this.audioContext = null;
         }
 
-        this.volume = 0;
-        this.smoothedHighRatio = 0;
-        this.volumeMeter.style.width = '0%';
+        this.resetAudioStats();
 
         this.micStartBtn.textContent = 'マイクを開始';
         this.micStartBtn.disabled = false;
         this.micStopBtn.disabled = true;
     }
 
+    resetAudioStats() {
+        this.volume = 0;
+        this.envelope = 0;
+        this.noiseFloor = 0.002;
+        this.levelPeak = 0.02;
+        this.smoothedHighRatio = 0;
+        if (this.volumeMeter) {
+            this.volumeMeter.style.width = '0%';
+        }
+    }
+
     handleAudioData(data) {
         if (!data) return;
+
+        if (this.hqAudioEnabled) {
+            this.handleAudioDataHQ(data);
+            return;
+        }
 
         const smoothing = 0.2;
         const ratio = data.high / (data.low + data.high + 1e-6);
@@ -348,10 +403,76 @@ class LipsyncEngine {
         this.setMouthState(nextState);
     }
 
+    handleAudioDataHQ(data) {
+        const ratio = data.high / (data.low + data.high + 1e-6);
+        const ratioSmoothing = 0.25;
+        this.smoothedHighRatio =
+            this.smoothedHighRatio * (1 - ratioSmoothing) +
+            ratio * ratioSmoothing;
+
+        const rms = data.rms;
+        const sensitivity = this.sensitivity / 100;
+        const attack = 0.35;
+        const release = 0.6;
+        const k = rms > this.envelope ? attack : release;
+        this.envelope = this.envelope * (1 - k) + rms * k;
+
+        if (!this.noiseFloor) {
+            this.noiseFloor = this.envelope;
+        }
+        if (this.envelope < this.noiseFloor) {
+            const fall = 0.25;
+            this.noiseFloor = this.noiseFloor * (1 - fall) + this.envelope * fall;
+        } else {
+            const rise = 0.01;
+            this.noiseFloor = this.noiseFloor * (1 - rise) + this.envelope * rise;
+        }
+
+        const peakDecay = 0.985;
+        this.levelPeak = Math.max(this.envelope, this.levelPeak * peakDecay);
+        const minRange = 0.006;
+        if (this.levelPeak < this.noiseFloor + minRange) {
+            this.levelPeak = this.noiseFloor + minRange;
+        }
+
+        const gateMargin = 0.002 + (1 - sensitivity) * 0.008;
+        const gateLevel = this.noiseFloor + gateMargin;
+        if (this.envelope < gateLevel) {
+            this.volume = 0;
+            this.volumeMeter.style.width = '0%';
+            this.setMouthState('closed');
+            return;
+        }
+
+        const rawLevel =
+            (this.envelope - this.noiseFloor) / (this.levelPeak - this.noiseFloor);
+        const level = Math.max(0, Math.min(1, rawLevel));
+        const gain = 0.6 + sensitivity * 0.8;
+        const shaped = Math.min(1, Math.pow(level, 0.75) * gain);
+
+        this.volume = shaped;
+        this.volumeMeter.style.width = Math.min(100, shaped * 100) + '%';
+
+        const thresholds = this.getVolumeThresholdsHQ();
+        const nextState = this.selectMouthStateHQ(
+            shaped,
+            this.smoothedHighRatio,
+            thresholds
+        );
+        this.setMouthState(nextState);
+    }
+
     getVolumeThresholds() {
         const sensitivity = this.sensitivity / 100;
         const closed = 0.008 + (1 - sensitivity) * 0.018;
         const half = 0.02 + (1 - sensitivity) * 0.06;
+        return { closed, half };
+    }
+
+    getVolumeThresholdsHQ() {
+        const sensitivity = this.sensitivity / 100;
+        const closed = 0.07 + (1 - sensitivity) * 0.08;
+        const half = 0.22 + (1 - sensitivity) * 0.12;
         return { closed, half };
     }
 
@@ -364,6 +485,54 @@ class LipsyncEngine {
         return 'open';
     }
 
+    selectMouthStateHQ(level, highRatio, thresholds) {
+        const hasHalf = !!this.mouthSpriteUrls.half;
+        const hasE = !!this.mouthSpriteUrls.e;
+        const hasU = !!this.mouthSpriteUrls.u;
+
+        const closeTh = Math.max(0.02, thresholds.closed - 0.03);
+        const halfDownTh = Math.max(closeTh + 0.02, thresholds.half - 0.02);
+
+        let state = this.mouthState;
+        if (state === 'e' || state === 'u') {
+            state = 'open';
+        }
+
+        if (state === 'closed') {
+            if (level >= thresholds.half) {
+                state = 'open';
+            } else if (level >= thresholds.closed && hasHalf) {
+                state = 'half';
+            } else if (level >= thresholds.closed) {
+                state = 'open';
+            } else {
+                state = 'closed';
+            }
+        } else if (state === 'half') {
+            if (level < closeTh) {
+                state = 'closed';
+            } else if (level >= thresholds.half) {
+                state = 'open';
+            } else {
+                state = 'half';
+            }
+        } else {
+            if (level < closeTh) {
+                state = 'closed';
+            } else if (level < halfDownTh && hasHalf) {
+                state = 'half';
+            } else {
+                state = 'open';
+            }
+        }
+
+        if (state === 'open') {
+            if (highRatio > 0.62 && hasE) return 'e';
+            if (highRatio < 0.38 && hasU) return 'u';
+        }
+        return state;
+    }
+
     setMouthState(state, force = false) {
         const sprite =
             this.mouthSprites[state] ||
@@ -372,7 +541,11 @@ class LipsyncEngine {
         if (!sprite) return;
 
         const now = performance.now();
-        if (!force && state !== this.mouthState && now - this.lastMouthChange < 70) {
+        if (
+            !force &&
+            state !== this.mouthState &&
+            now - this.lastMouthChange < this.mouthChangeMinMs
+        ) {
             return;
         }
 
